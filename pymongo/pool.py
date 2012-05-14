@@ -15,6 +15,7 @@
 import os
 import socket
 import sys
+import thread
 import time
 import threading
 import weakref
@@ -63,17 +64,12 @@ def _closed(sock):
 class SocketInfo(object):
     """Store a socket with some metadata
     """
-    def __init__(self, sock, poolref):
+    def __init__(self, sock, pool_id):
         self.sock = sock
-
-        # We can't strongly reference the Pool, because the Pool
-        # references this SocketInfo as long as it's in pool
-        self.poolref = poolref
-
         self.authset = set()
         self.closed = False
         self.last_checkout = time.time()
-        self.pool_id = poolref().pool_id
+        self.pool_id = pool_id
 
     def close(self):
         self.closed = True
@@ -83,23 +79,6 @@ class SocketInfo(object):
         except:
             pass
 
-    def __del__(self):
-        if not self.closed:
-            # This socket was given out, but not explicitly returned. Perhaps
-            # the socket was assigned to a thread local for a request, but the
-            # request wasn't ended before the thread died. Reclaim the socket
-            # for the pool.
-            pool = self.poolref()
-            if pool:
-                # Return a copy of self rather than self -- the Python docs
-                # discourage postponing deletion by adding a reference to self.
-                copy = SocketInfo(self.sock, self.poolref)
-                copy.authset = self.authset
-                pool.return_socket(copy)
-            else:
-                # Close socket now rather than awaiting garbage collector
-                self.close()
-
     def __eq__(self, other):
         return hasattr(other, 'sock') and self.sock == other.sock
 
@@ -107,8 +86,8 @@ class SocketInfo(object):
         return hash(self.sock)
 
     def __repr__(self):
-        return "SocketInfo(%s, %s)%s at %s" % (
-            repr(self.sock), repr(self.poolref()),
+        return "SocketInfo(%s)%s at %s" % (
+            repr(self.sock),
             self.closed and " CLOSED" or "",
             id(self)
         )
@@ -145,10 +124,8 @@ class BasePool(object):
         request_state = self._get_request_state()
         self.pid = os.getpid()
 
-        # Close sockets before deleting them, otherwise they'll come
-        # running back.
         if request_state not in (NO_REQUEST, NO_SOCKET_YET):
-            # request_state is a SocketInfo for this request
+            # request_state is a request socket.
             request_state.close()
 
         sockets = None
@@ -224,7 +201,7 @@ class BasePool(object):
                                         "not be configured with SSL support.")
 
         sock.settimeout(self.net_timeout)
-        return SocketInfo(sock, weakref.ref(self))
+        return SocketInfo(sock, self.pool_id)
 
     def get_socket(self, pair=None):
         """Get a socket from the pool.
@@ -370,12 +347,8 @@ class BasePool(object):
         pass
 
 
-# This thread-local will hold a Pool's per-thread request state. sock_info
-# defaults to NO_REQUEST each time it's accessed from a new thread. It's
-# much simpler to make a separate thread-local class rather than having Pool
-# inherit both from BasePool and threading.local.
-class _Local(threading.local):
-    sock_info = NO_REQUEST
+class ThreadVigil(object):
+    pass
 
 
 class Pool(BasePool):
@@ -385,17 +358,40 @@ class Pool(BasePool):
     to the pool when the thread calls end_request() or dies.
     """
     def __init__(self, *args, **kwargs):
-        self.local = _Local()
+        self._tid_to_sock = {}
+
+        # Weakrefs to threadlocals, so we know when threads die.
+        self._refs = {}
+        self._local = threading.local()
         super(Pool, self).__init__(*args, **kwargs)
 
+    # Overrides
     def _set_request_state(self, sock_info):
-        self.local.sock_info = sock_info
+        tid = thread.get_ident()
+
+        if sock_info == NO_REQUEST:
+            self._refs.pop(tid, None)
+            self._tid_to_sock.pop(tid, None)
+        else:
+            self._tid_to_sock[tid] = sock_info
+
+            def delete_callback(dummy):
+                # Avoid exceptions on interpreter shutdown.
+                if not hasattr(self, '_refs'):
+                    return
+
+                # End the request
+                self._refs.pop(tid, None)
+                request_sock = self._tid_to_sock.pop(tid, None)
+                self.return_socket(request_sock)
+
+            if tid not in self._refs:
+                self._local.vigil = vigil = ThreadVigil()
+                self._refs[tid] = weakref.ref(vigil, delete_callback)
 
     def _get_request_state(self):
-        return self.local.sock_info
-
-    def _reset(self):
-        self.local.sock_info = NO_REQUEST
+        tid = thread.get_ident()
+        return self._tid_to_sock.get(tid, NO_REQUEST)
 
 
 class GreenletPool(BasePool):
